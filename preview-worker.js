@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 const fs = require("fs")
 const path = require("path")
-const { execFile, spawn } = require("child_process")
+const { spawn } = require("child_process")
 const Preview = require("./PreviewModel.js")
 
 const target = process.argv[2] || ""
@@ -46,19 +46,46 @@ function readFd(fd, offset, length, callback) {
   })
 }
 
-function mimeTypeFromSample(sample, callback) {
-  const child = spawn("file", ["--brief", "--mime-type", "-"])
-  let stdout = ""
-  child.stdout.on("data", function(chunk) { stdout += chunk })
-  child.on("error", function() { callback("application/octet-stream") })
-  child.on("close", function(code) {
-    callback(code === 0 && stdout.trim() ? stdout.trim() : "application/octet-stream")
+function runWithInput(command, args, input, timeoutMs, maxBytes, callback) {
+  const child = spawn(command, args)
+  let stdout = Buffer.alloc(0)
+  let settled = false
+  const timer = setTimeout(function() {
+    child.kill("SIGTERM")
+  }, timeoutMs)
+
+  function finish(error, result) {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    callback(error, result)
+  }
+
+  child.stdout.on("data", function(chunk) {
+    stdout = Buffer.concat([stdout, chunk])
+    if (stdout.length > maxBytes) {
+      child.kill("SIGTERM")
+      finish(new Error("output exceeded maxBuffer"))
+    }
   })
-  child.stdin.end(sample)
+  child.stderr.resume()
+  child.on("error", function(error) { finish(error) })
+  child.on("close", function(code) {
+    if (code === 0) finish(null, stdout.toString("utf8"))
+    else finish(new Error(command + " exited with code " + code))
+  })
+  child.stdin.on("error", function() {})
+  child.stdin.end(input)
+}
+
+function mimeTypeFromSample(sample, callback) {
+  runWithInput("file", ["--brief", "--mime-type", "-"], sample, 2000, 4096, function(error, stdout) {
+    callback(!error && stdout && stdout.trim() ? stdout.trim() : "application/octet-stream")
+  })
 }
 
 function highlightedText(base, fileName, fallback, truncated) {
-  execFile("bat", [
+  runWithInput("bat", [
     "--color=always",
     "--style=plain",
     "--paging=never",
@@ -67,7 +94,7 @@ function highlightedText(base, fileName, fallback, truncated) {
     "--theme", batTheme,
     "--file-name", fileName,
     "-"
-  ], { input: fallback, timeout: 3000, maxBuffer: MAX_READ_BYTES * 8 }, function(error, stdout) {
+  ], fallback, 3000, MAX_READ_BYTES * 8, function(error, stdout) {
     if (error) {
       output({ ...base, state: "text", content: fallback, truncated: truncated, rich: false })
       return
