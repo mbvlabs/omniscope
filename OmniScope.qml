@@ -5,7 +5,6 @@ import QtQuick
 import QtQuick.Controls
 import qs.Commons
 import qs.Ui
-import "ScopeModel.js" as Scope
 import "LauncherModel.js" as Launchers
 import "FileIcons.js" as FileIcons
 
@@ -27,18 +26,29 @@ Item {
     property int selectedIndex: 0
     property bool cursorActive: true
     property bool appsLoaded: false
-    property bool filesLoaded: false
     property bool launchersLoaded: false
     property int loadRevision: 0
     property var desktopPaths: ({})
 
     property var apps: []              // raw app rows
-    property var files: []             // raw file rows
-    property var dynamicFiles: []      // full-home matches for the active query
-    property string dynamicFilesQuery: ""
     property var launchers: []          // Omarchy menu action rows
-    property var allItems: []          // combined raw items
     property var displayRows: []       // ranked, filtered rows for display
+    property bool searchReady: false
+    property bool searchBusy: false
+    property bool pagePending: false
+    property bool filesIndexed: false
+    property int indexedFileCount: 0
+    property int resultTotal: 0
+    property int searchRevision: 0
+    property int displayedRevision: -1
+    property int resultIndexVersion: -1
+    property int pendingSelection: -1
+    property real searchElapsedMs: 0
+    property string searchError: ""
+    readonly property string searchWorkerPath: root.manifest && root.manifest.__sourceDir
+        ? root.manifest.__sourceDir + "/bin/omniscope-search" : ""
+
+    ListModel { id: resultModel }
 
     readonly property string defaultMenuPath: root.omarchyPath + "/default/omarchy/omarchy-menu.jsonc"
     readonly property string userMenuPath: Quickshell.env("HOME") + "/.config/omarchy/extensions/omarchy-menu.jsonc"
@@ -106,8 +116,8 @@ Item {
 
     // ------------------------------------------------------------------ hooks
     function open(payloadJson) {
-        root.startLoad();
         root.opened = true;
+        root.startLoad();
         Qt.callLater(function () {
             keyCatcher.forceActiveFocus();
         });
@@ -116,8 +126,11 @@ Item {
     function close() {
         root.opened = false;
         root.filterText = "";
-        dynamicFilesTimer.stop();
-        dynamicFilesProc.pendingQuery = "";
+        root.searchRevision += 1;
+        root.sendSearch({type: "cancel"});
+        previewTimer.stop();
+        root.previewRevision += 1;
+        root.pendingPreview = null;
     }
 
     function toggle() {
@@ -143,24 +156,20 @@ Item {
     function startLoad() {
         root.loadRevision += 1;
         var revision = root.loadRevision;
-        root.appsLoaded = false;
-        root.filesLoaded = false;
         root.launchersLoaded = root.defaultMenuReady && root.userMenuReady;
         root.selectedIndex = 0;
         root.cursorActive = true;
         root.filterText = "";
-        root.dynamicFiles = [];
-        root.dynamicFilesQuery = "";
-        dynamicFilesTimer.stop();
-        dynamicFilesProc.pendingQuery = "";
         root.previewCache = ({});
         root.previewRequestedId = "";
         root.pendingPreview = null;
 
-        root.loadDesktopPaths(revision);
-        root.loadFiles(revision);
+        root.ensureSearchWorker();
+        if (!root.appsLoaded)
+            root.loadDesktopPaths(revision);
         if (root.launchersLoaded)
             root.rebuildLaunchers();
+        root.rebuildDisplay();
     }
 
     function loadDesktopPaths(revision) {
@@ -251,112 +260,11 @@ Item {
                 if (entry.comment)
                     raw.aliases = raw.aliases.concat([String(entry.comment)]);
             } catch (e) {}
-            raw.searchText = Scope.buildSearchText(raw);
             out.push(raw);
         }
         root.apps = out;
         root.appsLoaded = true;
         root.maybeFinished(revision);
-    }
-
-    function loadFiles(revision) {
-        if (!filesProc.running) {
-            filesProc.revision = revision;
-            filesProc.collected = "";
-            filesProc.command = ["fd", "--hidden", "--type", "file", "--exclude", ".git", "--exclude", "node_modules", "--exclude", ".cache", "--max-results", "3000", "--absolute-path", "", Quickshell.env("HOME")];
-            filesProc.running = true;
-        } else {
-            filesProc.pendingRevision = revision;
-        }
-    }
-
-    function parseFiles(raw) {
-        var lines = String(raw || "").split("\n");
-        var out = [];
-        var seen = ({});
-        for (var i = 0; i < lines.length; i++) {
-            var path = lines[i].trim();
-            if (!path)
-                continue;
-            if (seen[path])
-                continue;
-            seen[path] = true;
-            var name = path.split("/").pop();
-            out.push({
-                id: "file." + path,
-                kind: "file",
-                label: name,
-                detail: path,
-                appId: "",
-                appName: "",
-                path: path,
-                icon: FileIcons.iconForPath(path),
-                aliases: [],
-                searchText: Scope.buildSearchText({
-                    label: name,
-                    aliases: [],
-                    path: path
-                })
-            });
-        }
-        return out;
-    }
-
-    function scheduleDynamicFileSearch() {
-        var query = root.filterText.trim();
-        var fileScope = root.mode === "all" || root.mode === "files";
-        if (!root.opened || !fileScope || query.length < 2) {
-            dynamicFilesTimer.stop();
-            dynamicFilesProc.pendingQuery = "";
-            return;
-        }
-        if (root.dynamicFilesQuery === query)
-            return;
-        dynamicFilesTimer.restart();
-    }
-
-    function startDynamicFileSearch(query) {
-        var current = root.filterText.trim();
-        if (!root.opened || query !== current || query.length < 2)
-            return;
-        if (dynamicFilesProc.running) {
-            dynamicFilesProc.pendingQuery = query;
-            return;
-        }
-
-        var terms = query.split(/\s+/).filter(function (term) { return term.length > 0; });
-        if (terms.length === 0)
-            return;
-        var command = [
-            "fd", "--hidden", "--type", "file",
-            "--exclude", ".git", "--exclude", "node_modules", "--exclude", ".cache",
-            "--max-results", "3000", "--absolute-path", "--full-path", "--fixed-strings"
-        ];
-        for (var i = 1; i < terms.length; i++)
-            command.push("--and", terms[i]);
-        command.push("--", terms[0], Quickshell.env("HOME"));
-
-        dynamicFilesProc.query = query;
-        dynamicFilesProc.collected = "";
-        dynamicFilesProc.command = command;
-        dynamicFilesProc.running = true;
-    }
-
-    function searchableItems(query) {
-        if (!root.dynamicFiles.length || root.dynamicFilesQuery !== query)
-            return root.allItems;
-        var out = root.allItems.slice();
-        var seen = ({});
-        for (var i = 0; i < out.length; i++)
-            seen[out[i].id] = true;
-        for (var d = 0; d < root.dynamicFiles.length; d++) {
-            var row = root.dynamicFiles[d];
-            if (!seen[row.id]) {
-                seen[row.id] = true;
-                out.push(row);
-            }
-        }
-        return out;
     }
 
     function rebuildLauncherSources() {
@@ -368,8 +276,6 @@ Item {
 
     function rebuildLaunchers() {
         var rows = Launchers.buildLauncherRows(root.defaultMenuItems, root.userMenuItems, root.launcherWhenResults, root.defaultMenuPath);
-        for (var i = 0; i < rows.length; i++)
-            rows[i].searchText = Scope.buildSearchText(rows[i]);
         root.launchers = rows;
         root.launchersLoaded = true;
         root.maybeFinished(root.loadRevision);
@@ -395,70 +301,144 @@ Item {
     function maybeFinished(revision) {
         if (revision !== root.loadRevision)
             return;
-        if (!root.appsLoaded || !root.filesLoaded || !root.launchersLoaded)
-            return;
-        root.allItems = root.apps.concat(root.files).concat(root.launchers);
+        root.sendSearch({type: "replace", items: root.apps.concat(root.launchers)});
         root.rebuildDisplay();
     }
 
     // ------------------------------------------------------------------ search
     function setFilter(next) {
         root.filterText = next;
-        if (root.dynamicFilesQuery !== next.trim()) {
-            root.dynamicFiles = [];
-            root.dynamicFilesQuery = "";
-        }
         root.selectedIndex = 0;
         root.cursorActive = true;
         root.rebuildDisplay();
-        root.scheduleDynamicFileSearch();
     }
 
     function rebuildDisplay() {
-        var query = root.filterText.trim();
-        var source = root.searchableItems(query);
+        if (!root.opened)
+            return;
+        root.searchRevision += 1;
+        root.searchBusy = true;
+        root.pagePending = false;
+        root.pendingSelection = -1;
+        previewTimer.stop();
+        root.previewRevision += 1;
+        root.previewRequestedId = "";
+        root.pendingPreview = null;
+        root.requestSearchPage(0);
+    }
 
-        var scoped = source;
-        if (root.mode === "apps") {
-            scoped = [];
-            for (var a = 0; a < source.length; a++)
-                if (source[a].kind === "app")
-                    scoped.push(source[a]);
-        } else if (root.mode === "files") {
-            scoped = [];
-            for (var b = 0; b < source.length; b++)
-                if (source[b].kind === "file")
-                    scoped.push(source[b]);
-        } else if (root.mode === "launchers") {
-            scoped = [];
-            for (var c = 0; c < source.length; c++)
-                if (source[c].kind === "launcher")
-                    scoped.push(source[c]);
+    function ensureSearchWorker() {
+        if (searchProc.running)
+            return;
+        root.searchReady = false;
+        root.filesIndexed = false;
+        root.searchError = "";
+        searchProc.command = [root.searchWorkerPath];
+        searchProc.running = true;
+        searchStartupTimer.restart();
+    }
+
+    function sendSearch(message) {
+        if (root.searchReady && searchProc.running)
+            searchProc.write(JSON.stringify(message) + "\n");
+    }
+
+    function requestSearchPage(offset) {
+        root.sendSearch({type: "search", id: root.searchRevision, query: root.filterText.trim(),
+            mode: root.mode, offset: offset, limit: 100});
+    }
+
+    function loadMore() {
+        if (!root.opened || root.searchBusy || root.pagePending || root.displayRows.length >= root.resultTotal)
+            return;
+        root.pagePending = true;
+        root.requestSearchPage(root.displayRows.length);
+    }
+
+    function receiveSearch(data) {
+        var message;
+        try { message = JSON.parse(data); }
+        catch (error) {
+            root.searchError = "Search helper returned invalid data.";
+            root.searchBusy = false;
+            return;
         }
-
-        root.displayRows = Scope.search(scoped, query);
-
-        for (var n = 0; n < root.displayRows.length; n++) {
-            var rr = root.displayRows[n];
-            if (!rr.labelRanges)
-                rr.labelRanges = [];
-            if (!rr.pathRanges)
-                rr.pathRanges = [];
+        if (message.type === "ready") {
+            if (message.protocol !== 1) {
+                root.searchError = "Rebuild the search helper to update it.";
+                return;
+            }
+            searchStartupTimer.stop();
+            root.searchReady = true;
+            root.searchError = "";
+            root.sendSearch({type: "replace", items: root.apps.concat(root.launchers)});
+            root.rebuildDisplay();
+            return;
         }
-
-        if (root.displayRows.length === 0)
+        if (message.type === "indexed") {
+            root.filesIndexed = true;
+            root.indexedFileCount = message.count;
+            return;
+        }
+        if (message.type === "error") {
+            root.searchError = message.message || "Search failed.";
+            root.searchBusy = false;
+            root.pagePending = false;
+            return;
+        }
+        if (message.type !== "results" || !root.opened || message.id !== root.searchRevision
+            || message.query !== root.filterText.trim() || message.mode !== root.mode)
+            return;
+        var rows = message.rows || [];
+        if (message.offset !== 0 && (message.offset !== root.displayRows.length
+            || message.indexVersion !== root.resultIndexVersion)) {
+            root.rebuildDisplay();
+            return;
+        }
+        var selectedId = root.displayedRevision === root.searchRevision && root.displayRows[root.selectedIndex]
+            ? root.displayRows[root.selectedIndex].id : "";
+        var positionSelection = message.offset === 0 || root.pendingSelection >= 0;
+        // Model changes can emit contentYChanged while a page is being applied.
+        root.pagePending = true;
+        if (message.offset === 0) {
+            resultModel.clear();
+            root.displayRows = rows;
+        } else {
+            root.displayRows = root.displayRows.concat(rows);
+        }
+        for (var i = 0; i < rows.length; i++)
+            resultModel.append({rowId: rows[i].id});
+        root.resultTotal = message.total;
+        root.resultIndexVersion = message.indexVersion;
+        root.displayedRevision = message.id;
+        root.searchElapsedMs = message.elapsedMs;
+        root.searchBusy = false;
+        root.pagePending = false;
+        root.searchError = "";
+        if (selectedId && message.offset === 0) {
             root.selectedIndex = 0;
-        else if (root.selectedIndex >= root.displayRows.length)
-            root.selectedIndex = root.displayRows.length - 1;
-        else if (root.selectedIndex < 0)
-            root.selectedIndex = 0;
-
+            for (var s = 0; s < rows.length; s++)
+                if (rows[s].id === selectedId) { root.selectedIndex = s; break; }
+        }
+        if (root.pendingSelection >= 0) {
+            root.selectedIndex = root.pendingSelection;
+            root.pendingSelection = -1;
+        }
+        root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.displayRows.length - 1));
         Qt.callLater(function () {
-            if (root.selectedIndex >= 0 && root.selectedIndex < root.displayRows.length)
+            if (positionSelection && root.selectedIndex >= 0 && root.selectedIndex < root.displayRows.length)
                 resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain);
         });
-
         root.updatePreview();
+    }
+
+    function searchStatus() {
+        return JSON.stringify({ready: root.searchReady, indexed: root.filesIndexed,
+            opened: root.opened, workerPid: searchProc.processId,
+            files: root.indexedFileCount, query: root.filterText, mode: root.mode,
+            busy: root.searchBusy, total: root.resultTotal, loaded: root.displayRows.length,
+            selected: root.selectedIndex, preview: root.previewState,
+            elapsedMs: root.searchElapsedMs, error: root.searchError});
     }
 
     function updatePreview() {
@@ -521,17 +501,13 @@ Item {
     }
 
     function queueFilePreview(row, revision) {
-        var request = {
+        root.pendingPreview = {
             id: row.id,
             path: row.path,
             row: row,
             revision: revision
         };
-        if (previewProc.running) {
-            root.pendingPreview = request;
-            return;
-        }
-        root.startFilePreview(request);
+        previewTimer.restart();
     }
 
     function startFilePreview(request) {
@@ -579,12 +555,20 @@ Item {
     }
 
     function select(delta) {
-        if (root.displayRows.length === 0)
+        if (root.searchBusy || root.displayRows.length === 0)
             return;
         root.cursorActive = true;
+        var next = root.selectedIndex + delta;
+        if (next >= root.displayRows.length && root.displayRows.length < root.resultTotal) {
+            root.pendingSelection = next;
+            root.loadMore();
+            return;
+        }
         root.selectedIndex = (root.selectedIndex + delta + root.displayRows.length) % root.displayRows.length;
         resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain);
         root.updatePreview();
+        if (root.selectedIndex >= root.displayRows.length - 15)
+            root.loadMore();
     }
 
     function scrollPreview(pixels) {
@@ -595,7 +579,8 @@ Item {
     }
 
     function activateSelected() {
-        if (root.selectedIndex < 0 || root.selectedIndex >= root.displayRows.length)
+        if (!root.searchReady || root.searchError || root.searchBusy || root.displayedRevision !== root.searchRevision
+            || root.selectedIndex < 0 || root.selectedIndex >= root.displayRows.length)
             return;
         var row = root.displayRows[root.selectedIndex];
         if (!row)
@@ -613,36 +598,33 @@ Item {
         }
     }
 
-    function cycleMode() {
+    function cycleMode(direction) {
         var modes = ["all", "apps", "files", "launchers"];
         var idx = modes.indexOf(root.mode);
-        root.mode = modes[(idx + 1) % modes.length];
+        root.mode = modes[(idx + (direction === -1 ? -1 : 1) + modes.length) % modes.length];
         root.selectedIndex = 0;
         root.rebuildDisplay();
-        root.scheduleDynamicFileSearch();
     }
 
-    // Build a per-character model for a label so matched ranges can be accented.
-    // Returns a JS array of { ch, hit } objects consumed by Repeater.
-    function makeGlyphs(text, ranges) {
-        var out = [];
-        if (!ranges)
-            ranges = [];
-        var str = String(text || "");
-        for (var i = 0; i < str.length; i++) {
-            var hit = false;
-            for (var r = 0; r < ranges.length; r++) {
-                if (ranges[r] && i >= ranges[r].start && i < ranges[r].end) {
-                    hit = true;
-                    break;
-                }
-            }
-            out.push({
-                ch: str.charAt(i),
-                hit: hit
-            });
+    function escapeLabel(text) {
+        return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/\n/g, "↵");
+    }
+
+    // One Text per label; ranges from Rust use QML's UTF-16 offsets.
+    function highlightedLabel(text, ranges) {
+        var label = String(text || "");
+        var output = "";
+        var offset = 0;
+        for (var i = 0; ranges && i < ranges.length; i++) {
+            var start = Math.max(offset, ranges[i].start);
+            var end = Math.min(label.length, ranges[i].end);
+            output += root.escapeLabel(label.slice(offset, start));
+            output += '<font color="' + root.matchHighlight + '"><b>'
+                + root.escapeLabel(label.slice(start, end)) + '</b></font>';
+            offset = end;
         }
-        return out;
+        return output + root.escapeLabel(label.slice(offset));
     }
 
     function itemString(item, key) {
@@ -686,61 +668,49 @@ Item {
     }
 
     Process {
-        id: filesProc
-        property string collected: ""
-        property int revision: 0
-        property int pendingRevision: 0
+        id: searchProc
+        stdinEnabled: true
         stdout: SplitParser {
-            onRead: function (data) {
-                root.appendCollector(filesProc, data);
-            }
+            onRead: function (data) { root.receiveSearch(data); }
+        }
+        stderr: SplitParser {
+            onRead: function (data) { console.warn("OmniScope search: " + data); }
         }
         onExited: function (exitCode, exitStatus) {
-            if (filesProc.revision === root.loadRevision) {
-                root.files = root.parseFiles(filesProc.collected);
-                root.filesLoaded = true;
-                root.maybeFinished(filesProc.revision);
-            }
-            if (filesProc.pendingRevision) {
-                var rev = filesProc.pendingRevision;
-                filesProc.pendingRevision = 0;
-                root.loadFiles(rev);
+            root.searchReady = false;
+            root.searchBusy = false;
+            root.pagePending = false;
+            root.searchError = "Search helper stopped. Reopen OmniScope to retry.";
+        }
+    }
+
+    Timer {
+        id: searchStartupTimer
+        interval: 5000
+        onTriggered: {
+            if (!root.searchReady) {
+                root.searchBusy = false;
+                root.searchError = "Search helper unavailable. Run bash scripts/build-search.sh in the plugin directory.";
             }
         }
     }
 
     Timer {
-        id: dynamicFilesTimer
-        interval: 160
-        repeat: false
-        onTriggered: root.startDynamicFileSearch(root.filterText.trim())
+        interval: 60000
+        running: root.searchReady
+        repeat: true
+        onTriggered: root.sendSearch({type: "refresh"})
     }
 
-    Process {
-        id: dynamicFilesProc
-        property string collected: ""
-        property string query: ""
-        property string pendingQuery: ""
-        stdout: SplitParser {
-            onRead: function (data) {
-                root.appendCollector(dynamicFilesProc, data);
+    Timer {
+        id: previewTimer
+        interval: 75
+        onTriggered: {
+            if (!previewProc.running && root.pendingPreview && root.opened && !root.searchBusy) {
+                var request = root.pendingPreview;
+                root.pendingPreview = null;
+                root.startFilePreview(request);
             }
-        }
-        onExited: function (exitCode, exitStatus) {
-            var current = root.filterText.trim();
-            var fileScope = root.mode === "all" || root.mode === "files";
-            if (exitCode === 0 && exitStatus === 0 && root.opened && fileScope && dynamicFilesProc.query === current) {
-                root.dynamicFiles = root.parseFiles(dynamicFilesProc.collected);
-                root.dynamicFilesQuery = dynamicFilesProc.query;
-                root.rebuildDisplay();
-            }
-
-            var pending = dynamicFilesProc.pendingQuery;
-            dynamicFilesProc.pendingQuery = "";
-            if (pending && pending !== root.dynamicFilesQuery)
-                Qt.callLater(function () {
-                    root.startDynamicFileSearch(pending);
-                });
         }
     }
 
@@ -809,12 +779,8 @@ Item {
                 root.applyFilePreview(activeRow, previewProc.revision, data);
             }
 
-            var pending = root.pendingPreview;
-            root.pendingPreview = null;
-            if (pending)
-                Qt.callLater(function () {
-                    root.startFilePreview(pending);
-                });
+            if (root.pendingPreview)
+                previewTimer.restart();
         }
     }
 
@@ -858,8 +824,7 @@ Item {
     Connections {
         target: root.appLibrary
         function onAppsChanged() {
-            if (root.opened)
-                root.loadApps(root.loadRevision);
+            root.loadApps(root.loadRevision);
         }
     }
 
@@ -935,7 +900,7 @@ Item {
                         root.select(6);
                         event.accepted = true;
                     } else if (event.key === Qt.Key_Tab) {
-                        root.cycleMode();
+                        root.cycleMode(event.modifiers === Qt.ShiftModifier ? -1 : 1);
                         event.accepted = true;
                     } else if (Util.editsFilter(event, root.filterText)) {
                         root.setFilter(Util.editedFilter(event, root.filterText));
@@ -981,7 +946,13 @@ Item {
                                 clip: true
                                 spacing: root.rowSpacing
                                 boundsBehavior: Flickable.StopAtBounds
-                                model: root.displayRows
+                                model: resultModel
+                                visible: root.searchError === ""
+                                opacity: root.searchBusy ? 0.5 : 1
+                                onContentYChanged: {
+                                    if (contentY + height >= contentHeight - root.resultRowHeight * 10)
+                                        root.loadMore();
+                                }
                                 delegate: BorderSurface {
                                     id: row
                                     required property int index
@@ -1018,29 +989,21 @@ Item {
                                             spacing: root.tw2
                                             clip: true
 
-                                            Row {
-                                                id: labelGlyphRow
+                                            Text {
+                                                id: labelText
                                                 width: Math.min(implicitWidth, Math.round(parent.width * 0.44))
                                                 anchors.verticalCenter: parent.verticalCenter
-                                                clip: true
-
-                                                Repeater {
-                                                    id: glyphs
-                                                    model: root.makeGlyphs(root.itemString(row.item, "label"), row.item && row.item.labelRanges ? row.item.labelRanges : [])
-
-                                                    delegate: Text {
-                                                        text: modelData.ch
-                                                        textFormat: Text.PlainText
-                                                        color: modelData.hit ? root.matchHighlight : (row.hasCursor ? root.selectedText : root.foreground)
-                                                        font.family: root.fontFamily
-                                                        font.pixelSize: root.textSm
-                                                        font.weight: modelData.hit ? Font.Bold : Font.Normal
-                                                    }
-                                                }
+                                                text: root.highlightedLabel(root.itemString(row.item, "label"), row.item ? row.item.labelRanges : [])
+                                                textFormat: Text.StyledText
+                                                color: row.hasCursor ? root.selectedText : root.foreground
+                                                font.family: root.fontFamily
+                                                font.pixelSize: root.textSm
+                                                elide: Text.ElideRight
+                                                maximumLineCount: 1
                                             }
 
                                             Text {
-                                                width: Math.max(0, parent.width - labelGlyphRow.width - parent.spacing)
+                                                width: Math.max(0, parent.width - labelText.width - parent.spacing)
                                                 text: root.itemString(row.item, "path")
                                                 textFormat: Text.PlainText
                                                 color: row.hasCursor ? root.selectedText : root.foreground
@@ -1055,6 +1018,7 @@ Item {
 
                                     MouseArea {
                                         anchors.fill: parent
+                                        enabled: root.searchReady && !root.searchBusy && root.searchError === ""
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
                                         onEntered: {
@@ -1074,7 +1038,7 @@ Item {
                             Column {
                                 anchors.centerIn: parent
                                 spacing: root.tw2
-                                visible: root.displayRows.length === 0
+                                visible: root.displayRows.length === 0 || root.searchError !== ""
 
                                 Text {
                                     text: "\uf1c0"
@@ -1087,14 +1051,16 @@ Item {
                                 }
 
                                 Text {
-                                    text: root.filterText ? "No matches for “" + root.filterText + "”" : "Loading…"
+                                    text: root.searchError || (root.searchBusy ? "Searching…" : (!root.filesIndexed
+                                        && (root.mode === "all" || root.mode === "files") ? "Indexing files…"
+                                        : (root.filterText ? "No matches for “" + root.filterText + "”" : "No results")))
                                     color: root.foreground
                                     opacity: 0.7
                                     font.family: root.fontFamily
                                     font.pixelSize: root.textSm
                                     horizontalAlignment: Text.AlignHCenter
-                                    width: Math.min(resultsPane.width, 240)
-                                    elide: Text.ElideRight
+                                    width: resultsPane.width - root.tw4
+                                    wrapMode: Text.Wrap
                                 }
                             }
                         }
@@ -1130,7 +1096,7 @@ Item {
                                 }
 
                                 Text {
-                                    text: root.displayRows.length
+                                    text: root.resultTotal
                                     color: root.foreground
                                     opacity: 0.4
                                     font.family: root.fontFamily
@@ -1405,7 +1371,7 @@ Item {
                         anchors.bottom: parent.bottom
                         anchors.rightMargin: root.framePadding
                         anchors.bottomMargin: root.framePadding
-                        text: (root.displayRows.length ? (root.selectedIndex + 1) : 0) + "," + root.displayRows.length + "  " + root.modeTitle.toUpperCase()
+                        text: (root.displayRows.length ? (root.selectedIndex + 1) : 0) + "," + root.resultTotal + "  " + root.modeTitle.toUpperCase()
                         color: root.foreground
                         opacity: 0.62
                         font.family: root.fontFamily
