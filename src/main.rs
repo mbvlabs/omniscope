@@ -43,7 +43,6 @@ fn refresh(root: PathBuf, sender: mpsc::SyncSender<Event>, scanning: Arc<AtomicB
             result,
             started.elapsed().as_secs_f64() * 1000.0,
         ));
-        scanning.store(false, Ordering::Relaxed);
     });
 }
 
@@ -130,26 +129,30 @@ fn main() -> io::Result<()> {
             match event {
                 Event::Stop => return Ok(()),
                 Event::Error(message) => emit(&json!({"type": "error", "message": message}))?,
-                Event::Indexed(result, elapsed) => match result {
-                    Ok(files) => {
-                        let updated = !indexed || !catalog.same_files(&files);
-                        if updated {
-                            catalog.files = files;
-                            catalog.version += 1;
-                        }
-                        indexed = true;
-                        emit(
-                            &json!({"type": "indexed", "count": catalog.files.len(), "elapsedMs": elapsed}),
-                        )?;
-                        if updated {
-                            if let Some((query, _)) = &mut active {
-                                query.offset = 0;
+                Event::Indexed(result, elapsed) => {
+                    // A refresh immediately after `indexed` must not be lost.
+                    scanning.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(files) => {
+                            let updated = !indexed || !catalog.same_files(&files);
+                            if updated {
+                                catalog.files = files;
+                                catalog.version += 1;
                             }
-                            changed = true;
+                            indexed = true;
+                            emit(
+                                &json!({"type": "indexed", "count": catalog.files.len(), "elapsedMs": elapsed}),
+                            )?;
+                            if updated {
+                                if let Some((query, _)) = &mut active {
+                                    query.offset = 0;
+                                }
+                                changed = true;
+                            }
                         }
+                        Err(message) => emit(&json!({"type": "error", "message": message}))?,
                     }
-                    Err(message) => emit(&json!({"type": "error", "message": message}))?,
-                },
+                }
                 Event::Request(request, revision) => match request {
                     Request::Refresh => refresh(root.clone(), sender.clone(), scanning.clone()),
                     Request::Cancel => active = None,

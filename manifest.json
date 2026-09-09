@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mbvlabs.omniscope",
   "name": "OmniScope",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "mbvlabs",
   "license": "MIT",
   "description": "Telescope-inspired search for applications, files, previews, and Omarchy launchers",

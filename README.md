@@ -2,32 +2,24 @@
 
 ![OmniScope preview](preview.png)
 
-Telescope-inspired search for the Omarchy shell. OmniScope is a summoned menu plugin that searches applications, files, Omarchy launchers, and shows inline file previews.
+Telescope-inspired search for the Omarchy shell. Search applications, files, and Omarchy launchers, with inline file previews.
 
 ## Install
 
 ```sh
 omarchy plugin add https://github.com/mbvlabs/omniscope.git --enable
-cd ~/.config/omarchy/plugins/io.github.mbvlabs.omniscope
-bash scripts/build-search.sh
+omarchy restart shell
 ```
 
-Build the search helper after installing or updating the plugin. This requires
-a current stable Rust toolchain; on Omarchy, `omarchy pkg add rust` installs
-one. The build script installs the executable in the plugin's `bin/` directory
-and keeps compiler output in `~/.cache/omniscope/target`. Rust is only needed at
-build time. After updating, use `omarchy restart shell` to load the new helper
-and clear any cached QML code.
+That is the full install. The plugin ships a prebuilt Linux x86_64 `bin/omniscope-search` helper — no Rust toolchain and no build step.
 
 ## Usage
-
-Summon OmniScope from the shell:
 
 ```sh
 omarchy-shell shell summon io.github.mbvlabs.omniscope '{}'
 ```
 
-A common keybinding in `~/.config/hypr/bindings.lua`:
+Suggested keybinding in `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + SPACE", "OmniScope", "omarchy-shell shell summon io.github.mbvlabs.omniscope '{}'")
@@ -35,38 +27,33 @@ o.bind("SUPER + SPACE", "OmniScope", "omarchy-shell shell summon io.github.mbvla
 
 ### Modes
 
-- **All** — search across applications, files, and Omarchy launchers
+- **All** — applications, files, and Omarchy launchers
 - **Apps** — desktop applications only
-- **Files** — fuzzy search across the home-directory file index
+- **Files** — fuzzy search across your home-directory file index
 - **Launchers** — actions from your Omarchy menu configuration
 
-Use `Tab` / `Shift+Tab` to switch modes. Type to filter, arrow keys to navigate, `Enter` to open, `Escape` to close.
+`Tab` / `Shift+Tab` switch modes. Type to filter, arrows to move, `Enter` to open, `Escape` to close.
 
-The Rust helper stays alive between openings, indexes files in the background,
-and refreshes the index every 60 seconds. It includes hidden files, respects Git
-ignore rules, and excludes `.git`, `node_modules`, and `.cache` directories.
-New or deleted files appear after the next refresh. File queries match paths
-relative to your home directory; words may match in any order, and each word is
-fuzzy matched. Exact filenames and filename prefixes rank first. Results load
-in pages of 100 as you scroll or navigate; the count shows all matches.
+The search helper runs only while OmniScope is open. Closing the panel stops it and frees the in-memory index. Reopening indexes in the background; apps and launchers are available immediately. While open, the file index refreshes every 60 seconds.
 
-Only UTF-8 filenames are indexed. Spaces and embedded newlines are preserved.
-Application and launcher actions continue to use Omarchy's existing launchers.
+The index includes hidden files, respects Git ignore rules, and skips `.git`, `node_modules`, and `.cache`. File queries match paths relative to `$HOME` with fuzzy, unordered words. Exact filenames and prefixes rank first. Results page in chunks of 100.
+
+Only UTF-8 filenames are indexed. Application and launcher actions use Omarchy's existing launchers.
 
 ## Dependencies
 
-OmniScope uses the following executables (only the preview tools need to be on `PATH`):
-
 | Command | Used for |
 |---------|----------|
-| `bin/omniscope-search` | Persistent Rust indexing and fuzzy search (build above) |
+| `bin/omniscope-search` | Bundled indexing and fuzzy search (ships with the plugin) |
 | `node` | File preview worker |
 | `bat` | Syntax-highlighted text previews |
 | `file` | MIME type detection |
 
-On Omarchy, `bat` and `file` are typically already available. Ensure `node` is installed if you want file previews.
+On Omarchy, `bat` and `file` are usually present. Install `node` if you want file previews.
 
 ## Development
+
+Rust is only needed when changing the search helper:
 
 ```sh
 cargo test --locked
@@ -75,16 +62,9 @@ bash scripts/build-search.sh
 node scripts/benchmark-search.mjs
 ```
 
-The benchmark measures uncached queries against your home-directory index and
-reports both worker time and JSON round-trip time. An optional executable path
-and search root can be passed as its first and second arguments.
+`scripts/build-search.sh` rebuilds `bin/omniscope-search` into the plugin tree (compiler output under `~/.cache/omniscope/target`). Commit the updated binary so installs stay build-free.
 
-The helper accepts newline-delimited JSON on stdin: `replace` supplies app and
-launcher metadata, `search` accepts `id`, `query`, `mode`, `offset`, and `limit`,
-`refresh` rescans files, and `cancel` abandons the current search. Stdout contains
-`ready`, `indexed`, `results`, and `error` messages. Results include request IDs,
-index versions, total counts, and highlight ranges in UTF-16 offsets. Closing
-stdin terminates the helper. No file index is written to disk.
+The helper speaks newline-delimited JSON on stdin (`replace`, `search`, `refresh`, `cancel`) and writes `ready`, `indexed`, `results`, and `error` on stdout. Closing stdin stops it. No file index is written to disk.
 
 ## Remove
 

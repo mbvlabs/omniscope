@@ -1,0 +1,41 @@
+name: Build search helper
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/build-search.sh"
+      - "bin/omniscope-search"
+      - ".github/workflows/build-search.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/build-search.sh"
+      - "bin/omniscope-search"
+      - ".github/workflows/build-search.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require shipped binary
+        run: |
+          test -x bin/omniscope-search
+          file bin/omniscope-search
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build helper from source
+        run: bash scripts/build-search.sh
+
+      - name: Upload fresh build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniscope-search-linux-x86_64
+          path: bin/omniscope-search

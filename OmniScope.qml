@@ -34,6 +34,7 @@ Item {
     property var launchers: []          // Omarchy menu action rows
     property var displayRows: []       // ranked, filtered rows for display
     property bool searchReady: false
+    property bool searchStopping: false
     property bool searchBusy: false
     property bool pagePending: false
     property bool filesIndexed: false
@@ -45,16 +46,27 @@ Item {
     property int pendingSelection: -1
     property real searchElapsedMs: 0
     property string searchError: ""
-    readonly property string searchWorkerPath: root.manifest && root.manifest.__sourceDir
-        ? root.manifest.__sourceDir + "/bin/omniscope-search" : ""
+    // Omarchy strips __sourceDir from third-party manifests. Resolve bundled
+    // files against this QML document (must be a binding, not a JS helper —
+    // Qt.resolvedUrl uses the caller's document URL).
+    readonly property string pluginDir: {
+        var url = String(Qt.resolvedUrl(".") || "");
+        if (url.indexOf("file://") !== 0)
+            return "";
+        var path = decodeURIComponent(url.slice(7));
+        if (path.indexOf("localhost/") === 0)
+            path = path.slice(9);
+        while (path.length > 1 && path.charAt(path.length - 1) === "/")
+            path = path.slice(0, -1);
+        return path.charAt(0) === "/" ? path : "";
+    }
+    readonly property string searchWorkerPath: root.pluginDir ? root.pluginDir + "/bin/omniscope-search" : ""
+    readonly property string previewWorkerPath: root.pluginDir ? root.pluginDir + "/preview-worker.js" : ""
 
     ListModel { id: resultModel }
 
     readonly property string defaultMenuPath: root.omarchyPath + "/default/omarchy/omarchy-menu.jsonc"
     readonly property string userMenuPath: Quickshell.env("HOME") + "/.config/omarchy/extensions/omarchy-menu.jsonc"
-    readonly property string previewWorkerPath: root.manifest && root.manifest.__sourceDir
-        ? root.manifest.__sourceDir + "/preview-worker.js"
-        : ""
     property var defaultMenuItems: []
     property var userMenuItems: []
     property bool defaultMenuReady: false
@@ -117,6 +129,9 @@ Item {
     // ------------------------------------------------------------------ hooks
     function open(payloadJson) {
         root.opened = true;
+        // Clear a stuck stop gate from a previous close that missed onExited.
+        if (root.searchStopping && !searchProc.running && !searchProc.processId)
+            root.searchStopping = false;
         root.startLoad();
         Qt.callLater(function () {
             keyCatcher.forceActiveFocus();
@@ -127,10 +142,28 @@ Item {
         root.opened = false;
         root.filterText = "";
         root.searchRevision += 1;
-        root.sendSearch({type: "cancel"});
+        searchStartupTimer.stop();
+        root.searchError = "";
+        // Prefer processId: `running` can lag and leave searchStopping stuck,
+        // which then blocks every later ensureSearchWorker() call.
+        root.searchStopping = root.searchStopping || !!searchProc.processId || searchProc.running;
+        root.searchReady = false;
+        searchProc.running = false;
+        root.searchBusy = false;
+        root.pagePending = false;
+        root.filesIndexed = false;
+        root.indexedFileCount = 0;
+        root.resultTotal = 0;
+        root.displayRows = [];
+        resultModel.clear();
         previewTimer.stop();
         root.previewRevision += 1;
         root.pendingPreview = null;
+        root.previewCache = ({});
+        root.updatePreview();
+        // If onExited never fires, clear the stop gate so the next open works.
+        if (root.searchStopping)
+            searchStopFallback.restart();
     }
 
     function toggle() {
@@ -165,8 +198,8 @@ Item {
         root.pendingPreview = null;
 
         root.ensureSearchWorker();
-        if (!root.appsLoaded)
-            root.loadDesktopPaths(revision);
+        root.loadDesktopPaths(revision);
+        root.loadApps(revision);
         if (root.launchersLoaded)
             root.rebuildLaunchers();
         root.rebuildDisplay();
@@ -226,13 +259,49 @@ Item {
         return root.desktopPaths[id] || ("desktop-entry://" + id + ".desktop");
     }
 
-    function loadApps(revision) {
-        if (!root.appLibrary) {
-            root.appsLoaded = true;
-            root.maybeFinished(revision);
+    function desktopEntryName(entry) {
+        return String((entry && entry.name) || (entry && entry.id) || "");
+    }
+
+    function desktopEntrySubtext(entry) {
+        return String((entry && entry.genericName) || "");
+    }
+
+    function launchApp(appId, appName) {
+        if (root.appLibrary) {
+            root.appLibrary.launch(appId, appName);
             return;
         }
-        var rows = root.appLibrary.sortedEntries("");
+        var id = String(appId || "");
+        if (!id)
+            return;
+        // Same launch path AppLibrary uses when the shell facade is missing.
+        Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(id + ".desktop"));
+    }
+
+    function loadApps(revision) {
+        var rows = [];
+        if (root.appLibrary) {
+            rows = root.appLibrary.sortedEntries("");
+        } else {
+            // Omarchy injects manifest but sometimes not shell for third-party
+            // keepLoaded menus, which leaves appLibrary null. Use DesktopEntries
+            // directly so applications still appear in search.
+            var values = [];
+            try {
+                values = DesktopEntries.applications.values || [];
+            } catch (error) {
+                values = [];
+            }
+            for (var v = 0; v < values.length; v++) {
+                var desktopEntry = values[v];
+                if (!desktopEntry || desktopEntry.noDisplay)
+                    continue;
+                if (!root.desktopEntryName(desktopEntry))
+                    continue;
+                rows.push({entry: desktopEntry});
+            }
+        }
         var out = [];
         for (var i = 0; i < rows.length; i++) {
             var entry = rows[i].entry;
@@ -241,8 +310,8 @@ Item {
             var appId = String(entry.id || "");
             if (!appId)
                 continue;
-            var name = root.appLibrary.entryName(entry);
-            var generic = root.appLibrary.entrySubtext(entry);
+            var name = root.appLibrary ? root.appLibrary.entryName(entry) : root.desktopEntryName(entry);
+            var generic = root.appLibrary ? root.appLibrary.entrySubtext(entry) : root.desktopEntrySubtext(entry);
             var desktopPath = root.desktopPathFor(appId);
             var raw = {
                 id: "app." + appId,
@@ -328,8 +397,20 @@ Item {
     }
 
     function ensureSearchWorker() {
-        if (searchProc.running)
+        if (!root.opened)
             return;
+        // Recover from a missed onExited after close/reopen.
+        if (root.searchStopping && !searchProc.running && !searchProc.processId) {
+            root.searchStopping = false;
+            searchStopFallback.stop();
+        }
+        if (root.searchStopping || searchProc.running || searchProc.processId)
+            return;
+        if (!root.searchWorkerPath) {
+            root.searchBusy = false;
+            root.searchError = "Search helper path is missing from the plugin manifest.";
+            return;
+        }
         root.searchReady = false;
         root.filesIndexed = false;
         root.searchError = "";
@@ -356,6 +437,8 @@ Item {
     }
 
     function receiveSearch(data) {
+        if (!root.opened || root.searchStopping)
+            return;
         var message;
         try { message = JSON.parse(data); }
         catch (error) {
@@ -435,8 +518,11 @@ Item {
     function searchStatus() {
         return JSON.stringify({ready: root.searchReady, indexed: root.filesIndexed,
             opened: root.opened, workerPid: searchProc.processId,
-            files: root.indexedFileCount, query: root.filterText, mode: root.mode,
-            busy: root.searchBusy, total: root.resultTotal, loaded: root.displayRows.length,
+            running: searchProc.running, stopping: root.searchStopping,
+            worker: root.searchWorkerPath, files: root.indexedFileCount,
+            apps: root.apps.length, launchers: root.launchers.length,
+            query: root.filterText, mode: root.mode, busy: root.searchBusy,
+            total: root.resultTotal, loaded: root.displayRows.length,
             selected: root.selectedIndex, preview: root.previewState,
             elapsedMs: root.searchElapsedMs, error: root.searchError});
     }
@@ -587,8 +673,7 @@ Item {
             return;
         root.close();
         if (row.kind === "app") {
-            if (root.appLibrary)
-                root.appLibrary.launch(row.appId, row.appName);
+            root.launchApp(row.appId, row.appName);
         } else if (row.kind === "launcher") {
             Util.execDetached(row.action);
         } else {
@@ -677,10 +762,17 @@ Item {
             onRead: function (data) { console.warn("OmniScope search: " + data); }
         }
         onExited: function (exitCode, exitStatus) {
+            var restarting = root.searchStopping && root.opened;
+            root.searchStopping = false;
+            searchStopFallback.stop();
             root.searchReady = false;
             root.searchBusy = false;
             root.pagePending = false;
-            root.searchError = "Search helper stopped. Reopen OmniScope to retry.";
+            root.searchError = root.opened && !restarting
+                ? "Search helper stopped. Reopen OmniScope to retry." : "";
+            // A fast close/reopen may occur before the old process exits.
+            if (restarting)
+                Qt.callLater(root.ensureSearchWorker);
         }
     }
 
@@ -690,14 +782,28 @@ Item {
         onTriggered: {
             if (!root.searchReady) {
                 root.searchBusy = false;
-                root.searchError = "Search helper unavailable. Run bash scripts/build-search.sh in the plugin directory.";
+                root.searchError = !root.searchWorkerPath
+                    ? "Search helper path could not be resolved."
+                    : ("Search helper failed to start: " + root.searchWorkerPath);
             }
         }
     }
 
     Timer {
+        id: searchStopFallback
+        interval: 1500
+        onTriggered: {
+            if (!root.searchStopping)
+                return;
+            root.searchStopping = false;
+            if (root.opened)
+                root.ensureSearchWorker();
+        }
+    }
+
+    Timer {
         interval: 60000
-        running: root.searchReady
+        running: root.opened && root.searchReady
         repeat: true
         onTriggered: root.sendSearch({type: "refresh"})
     }
@@ -824,6 +930,14 @@ Item {
     Connections {
         target: root.appLibrary
         function onAppsChanged() {
+            root.loadApps(root.loadRevision);
+        }
+    }
+
+    Connections {
+        target: DesktopEntries.applications
+        enabled: !root.appLibrary
+        function onValuesChanged() {
             root.loadApps(root.loadRevision);
         }
     }
