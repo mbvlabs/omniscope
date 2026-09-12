@@ -650,7 +650,7 @@ Item {
             root.loadMore();
             return;
         }
-        root.selectedIndex = (root.selectedIndex + delta + root.displayRows.length) % root.displayRows.length;
+        root.selectedIndex = Math.max(0, Math.min(root.displayRows.length - 1, next));
         resultList.positionViewAtIndex(root.selectedIndex, ListView.End);
         root.updatePreview();
         if (root.selectedIndex >= root.displayRows.length - 15)
@@ -1002,16 +1002,16 @@ Item {
             root.scrollPreview(-root.resultRowHeight * 2);
             event.accepted = true;
         } else if (event.key === Qt.Key_Up) {
-                        root.select(-1);
-                        event.accepted = true;
-                    } else if (event.key === Qt.Key_Down) {
                         root.select(1);
                         event.accepted = true;
+                    } else if (event.key === Qt.Key_Down) {
+                        root.select(-1);
+                        event.accepted = true;
                     } else if (event.key === Qt.Key_PageUp) {
-                        root.select(-6);
+                        root.select(6);
                         event.accepted = true;
                     } else if (event.key === Qt.Key_PageDown) {
-                        root.select(6);
+                        root.select(-6);
                         event.accepted = true;
                     } else if (event.key === Qt.Key_Tab) {
                         root.cycleMode(event.modifiers === Qt.ShiftModifier ? -1 : 1);
