@@ -62,7 +62,17 @@ bash scripts/build-search.sh
 node scripts/benchmark-search.mjs
 ```
 
-`scripts/build-search.sh` rebuilds `bin/omniscope-search` into the plugin tree (compiler output under `~/.cache/omniscope/target`). Commit the updated binary so installs stay build-free.
+`scripts/build-search.sh` rebuilds `bin/omniscope-search` into the plugin tree (compiler output under `~/.cache/omniscope/target`) and refreshes its committed digest `bin/omniscope-search.sha256`. Commit both files together so installs stay build-free. The pinned toolchain in `rust-toolchain.toml` is installed automatically by rustup; development also requires `objcopy` (binutils) for the deterministic ELF normalization.
+
+### Supply-chain provenance
+
+The shipped `bin/omniscope-search` is a reproducible release build of `src/`:
+
+- `rust-toolchain.toml` pins the exact toolchain (`1.98.1`).
+- `bin/omniscope-search.sha256` is the committed SHA-256 of the shipped binary.
+- CI (`.github/workflows/build-search.yml`) runs `scripts/verify-search.sh`, which rebuilds from a clean checkout on Ubuntu 24.04 with SHA-pinned actions and **fails the push** whenever the shipped binary's digest does not match the freshly built binary — an unreviewed or tampered executable cannot ship.
+
+After changing anything under `src/`, `Cargo.toml`, or `Cargo.lock`, run `bash scripts/build-search.sh` and commit `bin/omniscope-search` + `bin/omniscope-search.sha256` together.
 
 The helper speaks newline-delimited JSON on stdin (`replace`, `search`, `refresh`, `cancel`) and writes `ready`, `indexed`, `results`, and `error` on stdout. Closing stdin stops it. No file index is written to disk.
 

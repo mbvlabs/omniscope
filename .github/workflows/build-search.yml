@@ -1,4 +1,12 @@
-name: Build search helper
+name: Build and verify search helper
+
+# Supply-chain gate: the prebuilt bin/omniscope-search that installs into every
+# user's plugin must provably match a clean build of src/.
+#
+#   * rust-toolchain.toml pins the exact toolchain (1.98.1).
+#   * bin/omniscope-search.sha256 is the committed digest of the shipped binary.
+#   * This workflow rebuilds from source on a fixed runner with SHA-pinned
+#     actions and rejects the push when the shipped binary differs.
 
 on:
   push:
@@ -6,36 +14,44 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "scripts/build-search.sh"
+      - "rust-toolchain.toml"
+      - "scripts/**"
       - "bin/omniscope-search"
+      - "bin/omniscope-search.sha256"
       - ".github/workflows/build-search.yml"
   pull_request:
     paths:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "scripts/build-search.sh"
+      - "rust-toolchain.toml"
+      - "scripts/**"
       - "bin/omniscope-search"
+      - "bin/omniscope-search.sha256"
       - ".github/workflows/build-search.yml"
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Require shipped binary
+      - name: Validate shipped binary against committed digest
         run: |
           test -x bin/omniscope-search
-          file bin/omniscope-search
+          (cd bin && sha256sum -c omniscope-search.sha256)
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (1.98.1)
+        uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          channel: "1.98.1"
 
-      - name: Build helper from source
-        run: bash scripts/build-search.sh
+      - name: Rebuild from source and reject divergence
+        run: bash scripts/verify-search.sh
 
       - name: Upload fresh build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: omniscope-search-linux-x86_64
           path: bin/omniscope-search
