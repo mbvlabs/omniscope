@@ -510,7 +510,7 @@ Item {
         root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.displayRows.length - 1));
         Qt.callLater(function () {
             if (positionSelection && root.selectedIndex >= 0 && root.selectedIndex < root.displayRows.length)
-                resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain);
+                resultList.positionViewAtIndex(root.selectedIndex, ListView.End);
         });
         root.updatePreview();
     }
@@ -651,7 +651,7 @@ Item {
             return;
         }
         root.selectedIndex = (root.selectedIndex + delta + root.displayRows.length) % root.displayRows.length;
-        resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain);
+        resultList.positionViewAtIndex(root.selectedIndex, ListView.End);
         root.updatePreview();
         if (root.selectedIndex >= root.displayRows.length - 15)
             root.loadMore();
@@ -1060,6 +1060,8 @@ Item {
                                 clip: true
                                 spacing: root.rowSpacing
                                 boundsBehavior: Flickable.StopAtBounds
+                                interactive: false
+                                verticalLayoutDirection: ListView.BottomToTop
                                 model: resultModel
                                 visible: root.searchError === ""
                                 opacity: root.searchBusy ? 0.5 : 1
@@ -1132,19 +1134,7 @@ Item {
 
                                     MouseArea {
                                         anchors.fill: parent
-                                        enabled: root.searchReady && !root.searchBusy && root.searchError === ""
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onEntered: {
-                                            root.cursorActive = true;
-                                            root.selectedIndex = row.index;
-                                            root.updatePreview();
-                                        }
-                                        onClicked: {
-                                            root.cursorActive = true;
-                                            root.selectedIndex = row.index;
-                                            root.activateSelected();
-                                        }
+                                        enabled: false
                                     }
                                 }
                             }
