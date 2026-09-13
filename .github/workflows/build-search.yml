@@ -45,7 +45,7 @@ jobs:
       - name: Install pinned toolchain (1.98.1)
         uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
-          channel: "1.98.1"
+          targets: x86_64-unknown-linux-gnu
 
       - name: Rebuild from source and reject divergence
         run: bash scripts/verify-search.sh
